@@ -31,16 +31,19 @@ import trace_ser;
 #endif
 import lighting;
 import direct_reservoir_common;
+import path_reservoir_common;
 
-public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
+public PathTraceResult tracePathSeeded(PathSegment seg, uint2 pix, bool captureMetadata,
+                                       uint replaySeed, uint proposalReplaySeed) {
     float3 L = float3(0.0, 0.0, 0.0);
     float3 ro = seg.ro;
     float3 rd = seg.rd;
     float3 throughput = seg.throughput;
-    // Pass A is fixed at one sample per pixel. Decorrelate each Pass B resample here so configured SPP
-    // produces independent lighting/BSDF paths from the shared terminal continuation.
-    uint seed = seg.seed ^ sampleIndex * 2246822519u;
-    seed = pcg(seed);
+    uint seed = replaySeed;
+    // Topology must describe transport structure, not the random seed. Temporal admission compares
+    // this key across frames; seed/sample identity lives separately in sampleId and replayState.
+    uint topologyKey = captureMetadata ? pathHash(0x91E10DA5u ^ uint(seg.bounce)) : 0u;
+    uint transportMask = 0u;
     float rayConeWidth = seg.rayConeWidth;
     float rayConeSpread = max(seg.rayConeSpread, RAY_CONE_MIN_SPREAD);
     int maxBounces = int(worldPush.maxBounces);
@@ -52,9 +55,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     // there is a real presampled RIS tile buffer; direct sharing made tile-shaped lighting noise visible.
     // Measured: making a 16x16 tile share this seed recovers at most 1.3ms, so a future pool should share
     // the POOL rather than the seed — the win is in removing dependent loads, not in coherence.
-    uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u
-            ^ worldPush.frameIndex * 2654435761u ^ sampleIndex * 2246822519u;
-    proposalSeed = pcg(proposalSeed);
+    uint proposalSeed = proposalReplaySeed;
     // The medium the segment starts in. For the camera segment that is water when the eye is submerged
     // (so the first ray already carries the right relative index and absorption); for a segment split off
     // a dielectric it is whatever the parent was travelling through.
@@ -92,6 +93,9 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             // packed show-celestial flag decides whether this path segment may see the bright disc.
             float3 sky = payload.albedo;
             L += throughput * sky; // escaped to sky
+            if (captureMetadata) {
+                topologyKey = pathTopologyStep(topologyKey, 0xF001u);
+            }
             break;
         }
 
@@ -108,6 +112,10 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0), RAY_CONE_MIN_WIDTH);
         uint material = payloadMaterial();
         int hitDepth = indirectDepth++;
+        if (captureMetadata) {
+            topologyKey = pathTopologyStep(topologyKey,
+                    (material & 0xFFu) | ((uint(hitDepth) & 0xFFu) << 8u));
+        }
         bool restirAtFirstInterface = (worldPush.flags & 2u) != 0u && hitDepth == 0
                 && pc.directReservoirAddr != 0;
         if (restirAtFirstInterface) {
@@ -171,10 +179,14 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
 
             bool chooseReflection = rndf(seed) < F;
             if (chooseReflection) {
+                transportMask |= PATH_TRANSPORT_DELTA;
+                if (captureMetadata) topologyKey = pathTopologyStep(topologyKey, 0xD101u);
                 rd = reflect(rd, n);
                 ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, SURF_BIAS);
             } else {
                 if (dot(transmittedDir, transmittedDir) <= 0.0) break; // TIR with F < 1 cannot happen
+                transportMask |= PATH_TRANSPORT_TRANSMISSION;
+                if (captureMetadata) topologyKey = pathTopologyStep(topologyKey, 0xD102u);
                 rd = normalize(transmittedDir);
                 ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, transmitBias);
                 // Crossing into or out of the volume. Absorption is the medium's job from here, so the
@@ -237,6 +249,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             throughput *= albedo;
             ro = hitPos + n * SURF_BIAS;
             rd = cosineDir(n, seed);
+            transportMask |= PATH_TRANSPORT_DIFFUSE;
+            if (captureMetadata) topologyKey = pathTopologyStep(topologyKey, 0xC101u);
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
             showCelestial = false; // diffuse receiver: direct sun/moon was handled by NEE above
             continue;
@@ -365,6 +379,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                 // degenerate VNDF at alpha=0 and preserves a genuinely sharp reflection without a floor.
                 l = reflect(rd, n);
                 throughput *= fresnelSchlick(clamp(dot(n, v), 0.0, 1.0), F0) / ps;
+                transportMask |= PATH_TRANSPORT_DELTA;
+                if (captureMetadata) topologyKey = pathTopologyStep(topologyKey, 0xB101u);
             } else {
                 float3 h = sampleGGXVNDF(n, v, rough, seed);
                 l = reflect(rd, h); // rd = -v: reflect the incoming ray about the microfacet normal
@@ -375,6 +391,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                 // VNDF + separable Smith ⇒ weight = F · G2/G1(v) = F · G1(l); divide by the lobe pdf ps.
                 float3 F = fresnelSchlick(max(0.0, dot(v, h)), F0);
                 throughput *= F * ggxG1(ndl2, rough) / ps;
+                transportMask |= PATH_TRANSPORT_GLOSSY;
+                if (captureMetadata) topologyKey = pathTopologyStep(topologyKey, 0xB102u);
                 rayConeSpread = max(rayConeSpread, rough * RAY_CONE_GLOSSY_SPREAD_SCALE);
             }
             ro = p;
@@ -384,6 +402,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             throughput *= diffAlb / (1.0 - ps);
             ro = p;
             rd = cosineDir(n, seed);
+            transportMask |= PATH_TRANSPORT_DIFFUSE;
+            if (captureMetadata) topologyKey = pathTopologyStep(topologyKey, 0xB103u);
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
             showCelestial = false; // diffuse lobe: disc covered by NEE, hide it (anti-firefly)
         }
@@ -397,13 +417,38 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             throughput /= q;
         }
     }
-    return L;
+    PathTraceResult result;
+    result.radiance = L;
+    result.depth = uint(max(indirectDepth, 0));
+    result.topologyKey = topologyKey;
+    result.replaySeed = replaySeed;
+    result.replayState = seed;
+    result.proposalReplaySeed = proposalReplaySeed;
+    result.proposalReplayState = proposalSeed;
+    result.transportMask = transportMask;
+    result.footprint = max(rayConeWidth, RAY_CONE_MIN_WIDTH);
+    return result;
+}
+
+// Normal rendering derives independent RNG streams from the transient segment/sample identity. Random
+// replay bypasses only this derivation and calls tracePathSeeded with the stored pair; all transport,
+// light proposals, and roulette decisions then execute through the exact same implementation.
+public PathTraceResult tracePath(PathSegment seg, uint2 pix, uint sampleIndex, bool captureMetadata) {
+    uint replaySeed = seg.seed ^ sampleIndex * 2246822519u;
+    replaySeed = pcg(replaySeed);
+    uint proposalReplaySeed = pix.x * 1973u + pix.y * 9277u + 26699u
+            ^ worldPush.frameIndex * 2654435761u ^ sampleIndex * 2246822519u;
+    proposalReplaySeed = pcg(proposalReplaySeed);
+    return tracePathSeeded(seg, pix, captureMetadata, replaySeed, proposalReplaySeed);
 }
 
 [shader("raygeneration")]
 void main() {
     worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
-    if (pc.debugView != 0u) {
+    bool pathDebug = pc.debugView == PATH_DEBUG_VIEW;
+    bool pathTemporalDebug = pc.debugView == PATH_TEMPORAL_DEBUG_VIEW;
+    bool pathCapture = (pc.historyFlags & 4u) != 0u && pc.pathReservoirAddr != 0;
+    if (pc.debugView != 0u && !pathDebug && !pathTemporalDebug) {
         return; // pass A owns guide visualization output
     }
     uint2 dispatchIndex = DispatchRaysIndex().xy;
@@ -411,19 +456,88 @@ void main() {
     int2 pix = int2(dispatchIndex);
     uint spp = max(worldPush.spp, 1u);
     uint pixelIndex = dispatchIndex.y * dimensions.x + dispatchIndex.x;
+    if ((pathDebug || pathTemporalDebug) && !pathCapture) {
+        outImage[pix] = float4(1.0, 0.0, 1.0, 1.0); // setting disabled / storage unavailable
+        return;
+    }
     ConstPtr<PackedPathSegment> queue = ConstPtr<PackedPathSegment>(pc.pathQueueAddr);
     float3 frameRadiance = float3(0.0, 0.0, 0.0);
-    uint recordIndex = pixelIndex;
-    for (uint leaf = 0u; leaf < MAX_PATH_SEGMENTS; ++leaf) {
-        PackedPathSegment packed = queue[recordIndex];
-        PathSegment segment = unpackPathSegment(packed);
-        for (uint s = 0u; s < spp; ++s) {
-            frameRadiance += tracePath(segment, uint2(pix), s + leaf * spp);
+    if (!pathCapture) {
+        uint recordIndex = pixelIndex;
+        for (uint leaf = 0u; leaf < MAX_PATH_SEGMENTS; ++leaf) {
+            PackedPathSegment packed = queue[recordIndex];
+            PathSegment segment = unpackPathSegment(packed);
+            for (uint s = 0u; s < spp; ++s) {
+                frameRadiance += tracePath(segment, uint2(pix), s + leaf * spp, false).radiance;
+            }
+            if (packed.nextRecord == PATH_NO_NEXT) {
+                break;
+            }
+            recordIndex = packed.nextRecord;
         }
-        if (packed.nextRecord == PATH_NO_NEXT) {
-            break;
-        }
-        recordIndex = packed.nextRecord;
+        outImage[pix] = float4(frameRadiance / float(spp), 1.0);
+        return;
     }
-    outImage[pix] = float4(frameRadiance / float(spp), 1.0);
+
+    PathReservoir pathReservoir = pathReservoirEmpty();
+    uint selectionSeed = pathHash(pixelIndex ^ worldPush.frameIndex * 747796405u ^ 2891336453u);
+    for (uint s = 0u; s < spp; ++s) {
+        float3 sampleRadiance = float3(0.0);
+        uint sampleDepth = 0u;
+        uint sampleTopology = pathHash(0x7F4A7C15u);
+        uint4 sampleReplaySeeds = uint4(0u);
+        uint sampleReplayState = 0u;
+        uint sampleProposalReplayState = 0u;
+        uint sampleReplaySegmentCount = 0u;
+        uint sampleTransportMask = 0u;
+        float sampleFootprint = RAY_CONE_MIN_WIDTH;
+        uint recordIndex = pixelIndex;
+        for (uint leaf = 0u; leaf < MAX_PATH_SEGMENTS; ++leaf) {
+            PackedPathSegment packed = queue[recordIndex];
+            PathSegment segment = unpackPathSegment(packed);
+            PathTraceResult traced = tracePath(segment, uint2(pix), s + leaf * spp, true);
+            if (leaf == 0u) {
+                sampleReplaySeeds.xy = uint2(traced.replaySeed, traced.proposalReplaySeed);
+            } else {
+                sampleReplaySeeds.zw = uint2(traced.replaySeed, traced.proposalReplaySeed);
+            }
+            sampleReplaySegmentCount = leaf + 1u;
+            sampleRadiance += traced.radiance;
+            sampleDepth = max(sampleDepth, traced.depth);
+            sampleTopology = pathTopologyStep(sampleTopology,
+                    traced.topologyKey ^ leaf * 668265263u);
+            sampleReplayState = pathHash(sampleReplayState ^ traced.replayState ^ leaf * 374761393u);
+            sampleProposalReplayState = pathHash(sampleProposalReplayState
+                    ^ traced.proposalReplayState ^ leaf * 1103515245u);
+            sampleTransportMask |= traced.transportMask;
+            sampleFootprint = max(sampleFootprint, traced.footprint);
+            if (packed.nextRecord == PATH_NO_NEXT) {
+                break;
+            }
+            recordIndex = packed.nextRecord;
+        }
+        frameRadiance += sampleRadiance;
+        PathCandidate candidate;
+        candidate.radiance = sampleRadiance;
+        candidate.depth = sampleDepth;
+        candidate.topologyKey = sampleTopology;
+        candidate.replaySeeds = sampleReplaySeeds;
+        candidate.replayState = sampleReplayState;
+        candidate.proposalReplayState = sampleProposalReplayState;
+        candidate.replaySegmentCount = sampleReplaySegmentCount;
+        candidate.transportMask = sampleTransportMask;
+        candidate.footprint = sampleFootprint;
+        uint sampleId = pathHash(worldPush.frameIndex * 2654435761u
+                ^ pixelIndex * 2246822519u ^ s * 3266489917u);
+        pathReservoirUpdate(pathReservoir, candidate, sampleId, pixelIndex,
+                pc.historyGeneration, selectionSeed);
+    }
+    DevicePtr<PathReservoir>(pc.pathReservoirAddr)[pixelIndex] = pathReservoir;
+    // View 14 is written by path_temporal_validate after this pass. Leaving outImage untouched here
+    // prevents an intermediate radiance image from leaking into the diagnostic if that pass changes.
+    if (!pathTemporalDebug) {
+        outImage[pix] = float4(pathDebug
+                ? pathReservoirDebug(pathReservoir, worldPush.maxBounces)
+                : frameRadiance / float(spp), 1.0);
+    }
 }

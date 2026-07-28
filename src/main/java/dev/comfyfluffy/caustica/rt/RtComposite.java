@@ -864,7 +864,8 @@ public final class RtComposite {
                 RtDirectReservoirHistory.BYTES_PER_RESERVOIR, reservoirBytes,
                 String.format(Locale.ROOT, "%.2f", reservoirBytes / (1024.0 * 1024.0)));
         if (restirPt) {
-            pathReservoirs.ensure(ctx, renderW, renderH);
+            pathReservoirs.ensure(ctx, renderW, renderH,
+                    gMotion, temporalValidation.metadata(), output);
             long pathReservoirBytes = pathReservoirs.allocatedBytes();
             CausticaMod.LOGGER.info(
                     "RT path reservoirs: render={}x{}, slots={}, stride={} B, bytes={}, gpuMiB={}",
@@ -1108,11 +1109,14 @@ public final class RtComposite {
                     terrain.lightGridSpanBufferAddress(), continuationQueue.deviceAddress,
                     directReservoirs.finalBuffer(reservoirFrame).deviceAddress,
                     restirPt ? pathReservoirs.finalBuffer(pathReservoirFrame).deviceAddress : 0L,
+                    restirPt && pathReservoirFrame.previousAvailable()
+                            ? pathReservoirs.previousBuffer(pathReservoirFrame).deviceAddress : 0L,
                     (int) frameCounter, debugView,
                     (reservoirFrame.previousAvailable() ? 1 : 0)
                             | (restirDirect ? 2 : 0)
                             | (restirPt ? 4 : 0)
-                            | (restirPt && pathReservoirFrame.previousAvailable() ? 8 : 0)).write(pushConstants);
+                            | (restirPt && pathReservoirFrame.previousAvailable() ? 8 : 0),
+                    restirPt ? (int) pathReservoirFrame.generation() : 0).write(pushConstants);
             try (RtFrameStats.Scope ignoredTrace = RtFrameStats.FRAME.stage("frame.trace")) {
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world primary trace");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.tracePrimary")) {
@@ -1134,6 +1138,15 @@ public final class RtComposite {
             }
             gpuFrameStats.markTemporalValidation(gpuStats, cmd);
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // validation writes visible; guide reads complete
+            if (restirPt) {
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd,
+                             "path temporal admission");
+                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage(
+                             "frame.pathTemporalAdmission")) {
+                    pathReservoirs.recordTemporalAdmission(cmd, pushConstants);
+                }
+                VulkanCommandEncoder.memoryBarrier(cmd, stack);
+            }
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "direct reservoir initialize");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.reservoirInit")) {
                 directReservoirs.recordInitialize(cmd, reservoirFrame);
