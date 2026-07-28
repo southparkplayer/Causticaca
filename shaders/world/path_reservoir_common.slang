@@ -12,7 +12,10 @@ public static const uint PATH_TRANSPORT_DELTA = 4u;
 public static const uint PATH_TRANSPORT_TRANSMISSION = 8u;
 // Increment whenever replay metadata or RNG interpretation changes. Temporal reuse must reject
 // reservoirs produced by a different contract instead of trying to replay an incompatible path.
-public static const uint PATH_REPLAY_VERSION = 2u;
+public static const uint PATH_REPLAY_VERSION = 5u;
+public static const uint PATH_CANONICAL_MODE_FLAG = 16u;
+public static const uint PATH_PROPOSAL_CANONICAL_VALID = 1u << 30u;
+public static const uint PATH_PROPOSAL_RESERVED_MASK = 1u << 31u;
 
 public struct PathTraceResult {
     public float3 radiance;
@@ -24,9 +27,20 @@ public struct PathTraceResult {
     public uint proposalReplayState;
     public uint transportMask;
     public float footprint;
-    // Light-selection PDF capture is diagnostic until continuation-event PDFs are also recorded.
+    // Proposal components are diagnostic until the radiance candidate is split into canonical
+    // contribution paths; the current candidate still sums NEE and continuation radiance.
     public float lightProposalPdf;
     public uint lightProposalEvents;
+    public float continuationProposalPdf;
+    public float rouletteProposalPdf;
+    public uint continuationProposalEvents;
+    public uint rouletteProposalEvents;
+    public float3 canonicalRadiance;
+    public uint canonicalValid;
+    public float canonicalContinuationProposalPdf;
+    public float canonicalRouletteProposalPdf;
+    public uint canonicalContinuationProposalEvents;
+    public uint canonicalRouletteProposalEvents;
 };
 
 // A complete screen-owned sample can contain both continuation records emitted by Pass A. Keep its
@@ -44,6 +58,16 @@ public struct PathCandidate {
     public float footprint;
     public float lightProposalPdf;
     public uint lightProposalEvents;
+    public float continuationProposalPdf;
+    public float rouletteProposalPdf;
+    public uint continuationProposalEvents;
+    public uint rouletteProposalEvents;
+    public float3 canonicalRadiance;
+    public uint canonicalValid;
+    public float canonicalContinuationProposalPdf;
+    public float canonicalRouletteProposalPdf;
+    public uint canonicalContinuationProposalEvents;
+    public uint canonicalRouletteProposalEvents;
 };
 
 public float pathLuminance(float3 color) {
@@ -58,6 +82,8 @@ public PathReservoir pathReservoirEmpty() {
     reservoir.identity = uint4(0u);
     reservoir.replay = uint4(0u);
     reservoir.replayControl = uint4(0u);
+    reservoir.proposalComponents = float4(0.0, 0.0, 0.0, 0.0);
+    reservoir.canonicalRadianceTarget = float4(0.0);
     return reservoir;
 }
 
@@ -76,6 +102,41 @@ public uint pathPackMetadata(uint generation, uint depth, uint transportMask) {
             | ((transportMask & 0xFu) << 28u);
 }
 
+public float pathCombineProposal(float left, float right) {
+    if (left <= 0.0 || right <= 0.0) return 0.0;
+    float combined = left * right;
+    return combined > 0.0 ? clamp(combined, 1.0e-30, 1.0e30) : 0.0;
+}
+
+public void pathAccumulateProposal(inout float product, inout uint events, float factor) {
+    product = pathCombineProposal(product, factor);
+    events++;
+}
+
+public uint pathPackProposalEvents(uint lightEvents, uint continuationEvents, uint rouletteEvents,
+                                   bool canonicalValid) {
+    return min(lightEvents, 1023u)
+            | (min(continuationEvents, 1023u) << 10u)
+            | (min(rouletteEvents, 1023u) << 20u)
+            | (canonicalValid ? PATH_PROPOSAL_CANONICAL_VALID : 0u);
+}
+
+public bool pathCanonicalEndpointConsistent(PathReservoir reservoir) {
+    uint packedEvents = asuint(reservoir.proposalComponents.w);
+    if ((packedEvents & PATH_PROPOSAL_CANONICAL_VALID) == 0u
+            || (packedEvents & PATH_PROPOSAL_RESERVED_MASK) != 0u) {
+        return false;
+    }
+    float3 radiance = reservoir.canonicalRadianceTarget.xyz;
+    float storedTarget = reservoir.canonicalRadianceTarget.w;
+    if (!all(radiance >= float3(0.0)) || !(storedTarget >= 0.0)) {
+        return false;
+    }
+    float expectedTarget = pathLuminance(radiance);
+    float tolerance = max(1.0e-5, expectedTarget * 1.0e-4);
+    return abs(expectedTarget - storedTarget) <= tolerance;
+}
+
 // Initial per-pixel RIS update. The traced path is already an importance-weighted Monte-Carlo
 // estimator, so this bootstrap stage uses an effective proposal density of one. A later replay pass
 // will replace it with decomposed path PDFs before any temporal or spatial path reuse is allowed.
@@ -84,12 +145,22 @@ public void pathReservoirUpdate(inout PathReservoir reservoir,
                                 uint sampleId,
                                 uint pathKey,
                                 uint historyGeneration,
-                                inout uint selectionSeed) {
-    float3 radiance = max(candidate.radiance, float3(0.0));
+                                inout uint selectionSeed,
+                                bool canonicalMode) {
+    if (canonicalMode && candidate.canonicalValid == 0u) {
+        return;
+    }
+    float3 radiance = canonicalMode
+            ? max(candidate.canonicalRadiance, float3(0.0))
+            : max(candidate.radiance, float3(0.0));
     float target = max(pathLuminance(radiance), 0.0);
-    // Bootstrap weighting remains unchanged. The captured light PDF is stored separately below;
-    // it is not yet a complete path PDF because continuation-lobe factors are still absent.
-    float proposalDensity = 1.0;
+    // The regular capture remains bootstrap-weighted because its candidate still sums multiple
+    // estimators. The opt-in canonical debug mode has one endpoint and uses its continuation and
+    // roulette products as the first path-only proposal-density contract.
+    float proposalDensity = canonicalMode
+            ? pathCombineProposal(candidate.canonicalContinuationProposalPdf,
+                    candidate.canonicalRouletteProposalPdf)
+            : 1.0;
     float candidateWeight = target / proposalDensity;
     float previousWeightSum = reservoir.weights.x;
     float nextWeightSum = min(previousWeightSum + candidateWeight, 1.0e30);
@@ -99,10 +170,20 @@ public void pathReservoirUpdate(inout PathReservoir reservoir,
 
     if (selectCandidate) {
         reservoir.sampleRadianceTarget = float4(radiance, target);
-        float capturedProposalDensity = candidate.lightProposalEvents > 0u
-                ? max(candidate.lightProposalPdf, 1.0e-20) : 0.0;
-        reservoir.proposalShift = float4(capturedProposalDensity, 1.0,
+        reservoir.proposalShift = float4(1.0, 1.0,
                 max(candidate.footprint, 1.0e-5), asfloat(candidate.replayState));
+        reservoir.proposalComponents = float4(
+                candidate.lightProposalPdf,
+                candidate.canonicalContinuationProposalPdf,
+                candidate.canonicalRouletteProposalPdf,
+                asfloat(pathPackProposalEvents(candidate.lightProposalEvents,
+                        candidate.canonicalContinuationProposalEvents,
+                        candidate.canonicalRouletteProposalEvents,
+                        candidate.canonicalValid != 0u)));
+        float3 canonicalRadiance = max(candidate.canonicalRadiance, float3(0.0));
+        float canonicalTarget = candidate.canonicalValid != 0u
+                ? max(pathLuminance(canonicalRadiance), 0.0) : 0.0;
+        reservoir.canonicalRadianceTarget = float4(canonicalRadiance, canonicalTarget);
         reservoir.identity = uint4(sampleId, pathKey, candidate.topologyKey,
                 pathPackMetadata(historyGeneration, candidate.depth, candidate.transportMask));
         // Storage-only replay contract. The current estimator deliberately does not consume this lane;
