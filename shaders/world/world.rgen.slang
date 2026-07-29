@@ -60,6 +60,9 @@ public PathTraceResult tracePathSeeded(PathSegment seg, uint2 pix, bool captureM
     uint canonicalContinuationProposalEvents = 0u;
     float canonicalRouletteProposalPdf = 1.0;
     uint canonicalRouletteProposalEvents = 0u;
+    float3 reconnectionVertex = float3(0.0);
+    bool reconnectionValid = false;
+    uint reconnectionDepth = 0u;
     int maxBounces = int(worldPush.maxBounces);
     int rrStart = maxBounces <= 3 ? 1 : 2;
     // RIS emitter NEE: direct lighting from block emitters is active when lights are published and the
@@ -130,6 +133,11 @@ public PathTraceResult tracePathSeeded(PathSegment seg, uint2 pix, bool captureM
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0), RAY_CONE_MIN_WIDTH);
         uint material = payloadMaterial();
         int hitDepth = indirectDepth++;
+        if (captureMetadata && !reconnectionValid && hitDepth == 1) {
+            reconnectionVertex = hitPos;
+            reconnectionValid = true;
+            reconnectionDepth = uint(hitDepth);
+        }
         if (captureMetadata) {
             topologyKey = pathTopologyStep(topologyKey,
                     (material & 0xFFu) | ((uint(hitDepth) & 0xFFu) << 8u));
@@ -525,6 +533,9 @@ public PathTraceResult tracePathSeeded(PathSegment seg, uint2 pix, bool captureM
     result.canonicalRouletteProposalPdf = canonicalRouletteProposalPdf;
     result.canonicalContinuationProposalEvents = canonicalContinuationProposalEvents;
     result.canonicalRouletteProposalEvents = canonicalRouletteProposalEvents;
+    result.reconnectionVertex = reconnectionVertex;
+    result.reconnectionValid = reconnectionValid ? 1u : 0u;
+    result.reconnectionDepth = reconnectionDepth;
     return result;
 }
 
@@ -545,9 +556,13 @@ void main() {
     worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
     bool pathDebug = pc.debugView == PATH_DEBUG_VIEW;
     bool pathTemporalDebug = pc.debugView == PATH_TEMPORAL_DEBUG_VIEW;
+    bool pathReplayDebug = pc.debugView == PATH_REPLAY_DEBUG_VIEW;
+    bool pathTemporalMergeDebug = pc.debugView == PATH_TEMPORAL_MERGE_DEBUG_VIEW;
+    bool pathSpatialDebug = pc.debugView == PATH_SPATIAL_DEBUG_VIEW;
     bool canonicalMode = (pc.historyFlags & PATH_CANONICAL_MODE_FLAG) != 0u;
     bool pathCapture = (pc.historyFlags & 4u) != 0u && pc.pathReservoirAddr != 0;
-    if (pc.debugView != 0u && !pathDebug && !pathTemporalDebug) {
+    if (pc.debugView != 0u && !pathDebug && !pathTemporalDebug && !pathReplayDebug
+            && !pathTemporalMergeDebug && !pathSpatialDebug) {
         return; // pass A owns guide visualization output
     }
     uint2 dispatchIndex = DispatchRaysIndex().xy;
@@ -555,7 +570,8 @@ void main() {
     int2 pix = int2(dispatchIndex);
     uint spp = max(worldPush.spp, 1u);
     uint pixelIndex = dispatchIndex.y * dimensions.x + dispatchIndex.x;
-    if ((pathDebug || pathTemporalDebug) && !pathCapture) {
+    if ((pathDebug || pathTemporalDebug || pathReplayDebug || pathTemporalMergeDebug || pathSpatialDebug)
+            && !pathCapture) {
         outImage[pix] = float4(1.0, 0.0, 1.0, 1.0); // setting disabled / storage unavailable
         return;
     }
@@ -603,6 +619,9 @@ void main() {
         uint sampleCanonicalContinuationProposalEvents = 0u;
         float sampleCanonicalRouletteProposalPdf = 1.0;
         uint sampleCanonicalRouletteProposalEvents = 0u;
+        float3 sampleReconnectionVertex = float3(0.0);
+        uint sampleReconnectionValid = 0u;
+        uint sampleReconnectionDepth = 0u;
         uint recordIndex = pixelIndex;
         for (uint leaf = 0u; leaf < MAX_PATH_SEGMENTS; ++leaf) {
             PackedPathSegment packed = queue[recordIndex];
@@ -639,6 +658,9 @@ void main() {
                 sampleCanonicalContinuationProposalEvents = traced.canonicalContinuationProposalEvents;
                 sampleCanonicalRouletteProposalPdf = traced.canonicalRouletteProposalPdf;
                 sampleCanonicalRouletteProposalEvents = traced.canonicalRouletteProposalEvents;
+                sampleReconnectionVertex = traced.reconnectionVertex;
+                sampleReconnectionValid = traced.reconnectionValid;
+                sampleReconnectionDepth = traced.reconnectionDepth;
             }
             if (packed.nextRecord == PATH_NO_NEXT) {
                 break;
@@ -668,20 +690,133 @@ void main() {
         candidate.canonicalRouletteProposalPdf = sampleCanonicalRouletteProposalPdf;
         candidate.canonicalContinuationProposalEvents = sampleCanonicalContinuationProposalEvents;
         candidate.canonicalRouletteProposalEvents = sampleCanonicalRouletteProposalEvents;
+        candidate.reconnectionVertex = sampleReconnectionVertex;
+        candidate.reconnectionValid = sampleReconnectionValid;
+        candidate.reconnectionDepth = sampleReconnectionDepth;
         uint sampleId = pathHash(worldPush.frameIndex * 2654435761u
                 ^ pixelIndex * 2246822519u ^ s * 3266489917u);
         uint canonicalStatus = pathReservoirUpdate(pathReservoir, candidate, sampleId, pixelIndex,
                 pc.historyGeneration, selectionSeed, canonicalMode);
         if (canonicalMode) {
             // Averaging categorical colors across SPP exposes the local admission ratio without
-            // allocating another persistent buffer or changing the 128-byte PathReservoir ABI.
+            // allocating another persistent buffer or changing the 144-byte PathReservoir ABI.
             canonicalDebugColor += pathCanonicalCandidateDebugColor(canonicalStatus);
         }
     }
+    uint temporalMergeStatus = 0u;
+    if (pathTemporalMergeDebug) {
+        if (pathReservoir.weights.y <= 0.0 || pathReservoir.sampleRadianceTarget.w <= 0.0) {
+            temporalMergeStatus |= PATH_TEMPORAL_CURRENT_EMPTY;
+        }
+        bool historyAvailable = (pc.historyFlags & 8u) != 0u
+                && pc.pathReservoirPreviousAddr != 0u;
+        if (!historyAvailable) {
+            temporalMergeStatus |= PATH_TEMPORAL_HISTORY_EMPTY;
+        } else {
+            // T-049 intentionally uses identity temporal mapping. Motion-vector reprojection stays
+            // in the admission pass until a replay/reconnection shift is defined for it.
+            PathReservoir previous =
+                    ConstPtr<PathReservoir>(pc.pathReservoirPreviousAddr)[pixelIndex];
+            if (previous.weights.y <= 0.0 || previous.sampleRadianceTarget.w <= 0.0) {
+                temporalMergeStatus |= PATH_TEMPORAL_HISTORY_EMPTY;
+            } else if (previous.replayControl.x != PATH_REPLAY_VERSION
+                    || previous.replayControl.y < 1u
+                    || previous.replayControl.y > MAX_PATH_SEGMENTS
+                    || (previous.replayControl.y < MAX_PATH_SEGMENTS
+                            && any(previous.replay.zw != uint2(0u)))) {
+                temporalMergeStatus |= PATH_TEMPORAL_REPLAY_REJECT;
+            } else {
+                PathReplayAggregate replay = pathReplayAggregateEmpty();
+                uint expectedSegments = previous.replayControl.y;
+                uint recordIndex = previous.identity.y;
+                bool chainComplete = true;
+                for (uint leaf = 0u; leaf < MAX_PATH_SEGMENTS; ++leaf) {
+                    if (leaf >= expectedSegments || recordIndex == PATH_NO_NEXT) {
+                        break;
+                    }
+                    PackedPathSegment packed = queue[recordIndex];
+                    PathSegment segment = unpackPathSegment(packed);
+                    uint replaySeed = leaf == 0u
+                            ? previous.replay.x : previous.replay.z;
+                    uint proposalReplaySeed = leaf == 0u
+                            ? previous.replay.y : previous.replay.w;
+                    PathTraceResult traced = tracePathSeeded(
+                            segment, uint2(pix), true, replaySeed, proposalReplaySeed);
+                    pathReplayAccumulate(replay, traced, leaf);
+                    if (leaf + 1u == expectedSegments) {
+                        chainComplete = packed.nextRecord == PATH_NO_NEXT;
+                        break;
+                    }
+                    if (packed.nextRecord == PATH_NO_NEXT) {
+                        chainComplete = false;
+                        break;
+                    }
+                    recordIndex = packed.nextRecord;
+                }
+                if (!chainComplete || replay.replaySegmentCount != expectedSegments
+                        || pathReplayCompare(previous, replay) != 0u) {
+                    temporalMergeStatus |= PATH_TEMPORAL_REPLAY_REJECT;
+                } else {
+                    PathCandidate shifted = pathCandidateFromReplay(replay, previous);
+                    temporalMergeStatus |= pathReservoirTemporalMerge(pathReservoir, previous,
+                            shifted, pixelIndex, pc.historyGeneration, selectionSeed);
+                }
+            }
+        }
+    }
     DevicePtr<PathReservoir>(pc.pathReservoirAddr)[pixelIndex] = pathReservoir;
+    if (pathTemporalMergeDebug) {
+        outImage[pix] = float4(pathTemporalMergeDebugColor(temporalMergeStatus), 1.0);
+    }
+    if (pathReplayDebug) {
+        uint replayMismatch = PATH_REPLAY_EMPTY;
+        if (pathReservoir.weights.y > 0.0) {
+            replayMismatch = PATH_REPLAY_ABI_MISMATCH;
+        }
+        if (pathReservoir.weights.y > 0.0
+                && pathReservoir.replayControl.x == PATH_REPLAY_VERSION
+                && pathReservoir.replayControl.y >= 1u
+                && pathReservoir.replayControl.y <= MAX_PATH_SEGMENTS
+                && (pathReservoir.replayControl.y == MAX_PATH_SEGMENTS
+                        || all(pathReservoir.replay.zw == uint2(0u)))) {
+            PathReplayAggregate replay = pathReplayAggregateEmpty();
+            uint expectedSegments = pathReservoir.replayControl.y;
+            uint recordIndex = pathReservoir.identity.y;
+            bool chainComplete = true;
+            for (uint leaf = 0u; leaf < MAX_PATH_SEGMENTS; ++leaf) {
+                if (leaf >= expectedSegments || recordIndex == PATH_NO_NEXT) {
+                    break;
+                }
+                PackedPathSegment packed = queue[recordIndex];
+                PathSegment segment = unpackPathSegment(packed);
+                uint replaySeed = leaf == 0u
+                        ? pathReservoir.replay.x : pathReservoir.replay.z;
+                uint proposalReplaySeed = leaf == 0u
+                        ? pathReservoir.replay.y : pathReservoir.replay.w;
+                PathTraceResult traced = tracePathSeeded(
+                        segment, uint2(pix), true, replaySeed, proposalReplaySeed);
+                pathReplayAccumulate(replay, traced, leaf);
+                if (leaf + 1u == expectedSegments) {
+                    chainComplete = packed.nextRecord == PATH_NO_NEXT;
+                    break;
+                }
+                if (packed.nextRecord == PATH_NO_NEXT) {
+                    chainComplete = false;
+                    break;
+                }
+                recordIndex = packed.nextRecord;
+            }
+            if (!chainComplete || replay.replaySegmentCount != expectedSegments) {
+                replayMismatch = PATH_REPLAY_SEGMENT_MISMATCH;
+            } else {
+                replayMismatch = pathReplayCompare(pathReservoir, replay);
+            }
+        }
+        outImage[pix] = float4(pathReplayDebugColor(replayMismatch), 1.0);
+    }
     // View 14 is written by path_temporal_validate after this pass. Leaving outImage untouched here
     // prevents an intermediate radiance image from leaking into the diagnostic if that pass changes.
-    if (!pathTemporalDebug) {
+    if (!pathTemporalDebug && !pathReplayDebug && !pathTemporalMergeDebug && !pathSpatialDebug) {
         outImage[pix] = float4(pathDebug
                 ? (canonicalMode
                         ? canonicalDebugColor / float(spp)

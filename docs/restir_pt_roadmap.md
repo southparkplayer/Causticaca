@@ -109,10 +109,11 @@ identity) over a raw transient primitive index where practical.
 Reservoir storage is double-buffered. The first implementation favors clarity
 and validation over minimum byte size; packing follows only after captures
 identify the real bandwidth and memory pressure.
-The current eight-lane path record is 128 B/pixel/slot; its proposal lane keeps
+The current nine-lane path record is 144 B/pixel/slot; its proposal lane keeps
 light-selection, canonical continuation, and roulette PDF products separate from
 the shift Jacobian. Its packed metadata includes an explicit canonical-endpoint
-validity bit, and the final lane stores one replayable sky/emissive endpoint.
+validity bit, one lane stores a replayable sky/emissive endpoint, and the final
+lane stores the selected canonical path's second-hit reconnection vertex.
 
 ### Path Sample and Reservoir
 
@@ -131,7 +132,20 @@ canonical path representation:
 The current wavefront replay contract is deliberately stricter than a final GRIS shift:
 replay version, segment count, transport RNG state, and light-proposal RNG state must all
 match before a path is considered replay-compatible. The shader-independent
-`RtPathReplayReference` test is the authority for this admission rule. A future reconnection
+`RtPathReplayReference` test is the authority for this admission rule. Debug view 15 performs an
+opt-in seeded replay of the selected reservoir path using the stored seed pairs and compares the
+reconstructed terminal states, topology, endpoint, proposal lane, and packed metadata. Its green
+output means an exact replay; red/orange/cyan/blue/magenta/yellow channels identify path-state,
+proposal-state, ABI, topology/metadata, endpoint, and proposal-lane mismatches respectively.
+Debug view 16 is the first opt-in GRIS temporal merge. It uses identity temporal mapping, replays
+the historical sample on the current queue, requires an exact replay plus strict
+depth/transport/topology/footprint compatibility, caps the source effective count at eight, and
+uses an explicit unit shift Jacobian. Green means the historical sample was selected, darker green
+means the merge was accepted while the current sample remained selected, cyan is replay rejection,
+blue/purple are compatibility/footprint rejection, gray is empty history, and black means both
+reservoirs are empty. This mode updates only the path-history reference reservoir; it does not feed
+the active image estimator.
+A future reconnection
 mapping may relax the identity checks only together with a measured Jacobian/PDF mapping and
 new reference tests; it must not silently treat the two RNG streams as one seed.
 
@@ -155,6 +169,16 @@ cyan is an invalid continuation PDF, orange is an invalid roulette PDF, and yell
 combined proposal/importance weight. Colors are averaged across SPP so the view also shows the
 local admission ratio. Canonical candidates are rejected before PDF division, keeping invalid
 values out of the reservoir; normal rendering and view 14 do not consume this diagnostic path.
+
+Spatial path reuse has a separate reference boundary. Neighbor admission reuses the direct-light
+surface policy (material, normal, relative depth) and additionally requires path depth, topology,
+transport class, and bounded footprint. The 144-byte record now stores the selected canonical
+path's second-hit reconnection vertex, but a shift still cannot be enabled until replay exposes
+the corresponding source/receiver geometric and directional-PDF terms.
+The CPU reference therefore records the solid-angle Jacobian
+`|cos(theta_receiver) / cos(theta_source)| * d_source^2 / d_receiver^2` and the primary-sample
+form multiplies it by `p_receiver / p_source`; random replay contributes unit Jacobian. This
+keeps spatial admission testable without silently introducing a biased neighbor merge.
 
 ## Delivery Phases
 
@@ -273,6 +297,11 @@ Exit gate:
 - reuse diffuse and specular paths only in compatibility domains already
   covered by tests
 - keep direct-light-only and no-reuse modes for comparisons
+
+The first implementation milestone is debug view 16: an identity-map temporal merge with a unit
+Jacobian and strict seeded replay. It intentionally precedes motion-vector reprojection and
+reconnection so the GRIS weight and effective-count accounting can be validated without hiding
+mapping errors behind a more permissive shift.
 
 Exit gate:
 

@@ -103,14 +103,35 @@ at 1280x673 and 295.6 MiB at 1920x1009. This intentionally favors inspectable
 ReSTIR/GRIS semantics over packing until profiling identifies real bandwidth
 or residency pressure.
 
-The path-reservoir ABI is currently 128 bytes per pixel per slot. Its replay-control
+The path-reservoir ABI is currently 144 bytes per pixel per slot. Its replay-control
 lane stores the two wavefront segment seed pairs, segment count, replay version, and
 terminal-state hashes; the additional proposal-components lane captures light,
 continuation, and roulette PDF products plus event counters (including an explicit
 canonical-endpoint validity bit), while the canonical radiance lane stores one
-replayable sky/emissive endpoint. Two path-history slots
-therefore use about 210.3 MiB at 1280x673 and 473.0 MiB at 1920x1009. This is
+replayable sky/emissive endpoint. The final lane stores the selected canonical
+path's second-hit reconnection vertex and packed valid/depth metadata. Two path-history slots
+therefore use about 236.6 MiB at 1280x673 and 532.1 MiB at 1920x1009. This is
 intentional: replay correctness is being established before any packing or compression pass.
+Debug view 15 is an opt-in seeded replay evaluator: it re-traces the selected reservoir's stored
+segment seeds and color-codes independent mismatches in terminal path/proposal state, topology,
+endpoint, proposal components, metadata, and replay ABI. It does not feed the estimator or alter
+the normal render.
+
+Debug view 16 is the opt-in path-temporal merge reference. It replays the previous same-pixel
+reservoir on the current queue, applies strict topology/depth/transport/footprint admission, caps
+the historical effective count at eight, and uses an identity shift with Jacobian one. Green means
+history was selected; darker green means the merge was accepted but the current sample remained
+selected; cyan is replay rejection; blue and purple are compatibility and footprint rejection;
+gray is empty history; black is an empty current/history pair. The merged reservoir is stored only
+for this debug history chain and is not consumed by the active image estimator.
+
+The next spatial-reuse reference remains CPU-only while replay plumbing exposes the geometric and
+directional-PDF terms associated with the newly stored reconnection vertex.
+It admits a neighbor only when material, normal, relative depth, path topology/depth/transport,
+and footprint agree. Its reconnection Jacobian is the solid-angle geometry ratio followed by the
+receiver/source directional-PDF ratio in primary-sample space; a random-replay segment has unit
+Jacobian. Do not add a GPU neighbor merge by copying the direct-light pass while these terms are
+absent from `PathReservoir`.
 
 ## Linux
 

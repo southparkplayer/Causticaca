@@ -14,6 +14,7 @@ import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkComputePipelineCreateInfo;
+import org.lwjgl.vulkan.VkDescriptorBufferInfo;
 import org.lwjgl.vulkan.VkDescriptorImageInfo;
 import org.lwjgl.vulkan.VkDescriptorPoolCreateInfo;
 import org.lwjgl.vulkan.VkDescriptorPoolSize;
@@ -30,7 +31,9 @@ import org.lwjgl.vulkan.VkWriteDescriptorSet;
 /** GPU temporal-admission diagnostics for path reservoirs; it deliberately performs no GRIS merge. */
 public final class RtPathTemporalPipeline {
     private static final String SHADER_DIR = "/caustica/rt/";
-    private static final int IMAGE_COUNT = 3;
+    private static final int IMAGE_COUNT = 5;
+    private static final int BUFFER_COUNT = 2;
+    private static final int RESOURCE_COUNT = IMAGE_COUNT + BUFFER_COUNT;
 
     private final RtContext ctx;
     private final long descriptorSetLayout;
@@ -51,14 +54,20 @@ public final class RtPathTemporalPipeline {
     }
 
     public static RtPathTemporalPipeline create(RtContext ctx, long receiverMotionView,
-                                                long validationMetadataView, long debugColorView) {
+                                                long validationMetadataView, long debugColorView,
+                                                long receiverPositionMaterialView,
+                                                long receiverNormalRoughnessView,
+                                                long spatialDiagnosticCounterBuffer,
+                                                long spatialDiagnosticPairBuffer) {
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorSetLayoutBinding.Buffer bindings =
-                    VkDescriptorSetLayoutBinding.calloc(IMAGE_COUNT, stack);
-            for (int binding = 0; binding < IMAGE_COUNT; binding++) {
+                    VkDescriptorSetLayoutBinding.calloc(RESOURCE_COUNT, stack);
+            for (int binding = 0; binding < RESOURCE_COUNT; binding++) {
                 bindings.get(binding).binding(binding)
-                        .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        .descriptorType(binding < IMAGE_COUNT
+                                ? VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                : VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                         .descriptorCount(1)
                         .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
             }
@@ -71,9 +80,11 @@ public final class RtPathTemporalPipeline {
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, descriptorSetLayout,
                     "path temporal descriptor set layout");
 
-            VkDescriptorPoolSize.Buffer poolSize = VkDescriptorPoolSize.calloc(1, stack);
+            VkDescriptorPoolSize.Buffer poolSize = VkDescriptorPoolSize.calloc(2, stack);
             poolSize.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .descriptorCount(IMAGE_COUNT);
+            poolSize.get(1).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+                    .descriptorCount(BUFFER_COUNT);
             VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
                     .sType$Default().maxSets(1).pPoolSizes(poolSize);
             check(VK10.vkCreateDescriptorPool(vk, poolInfo, null, handle),
@@ -116,7 +127,9 @@ public final class RtPathTemporalPipeline {
             VK10.vkDestroyShaderModule(vk, module, null);
 
             bindImages(vk, stack, descriptorSet,
-                    receiverMotionView, validationMetadataView, debugColorView);
+                    receiverMotionView, validationMetadataView, debugColorView,
+                    receiverPositionMaterialView, receiverNormalRoughnessView,
+                    spatialDiagnosticCounterBuffer, spatialDiagnosticPairBuffer);
             return new RtPathTemporalPipeline(ctx, descriptorSetLayout, descriptorPool,
                     descriptorSet, pipelineLayout, pipeline);
         }
@@ -147,16 +160,31 @@ public final class RtPathTemporalPipeline {
 
     private static void bindImages(VkDevice vk, MemoryStack stack, long set,
                                    long receiverMotionView, long validationMetadataView,
-                                   long debugColorView) {
-        long[] views = {receiverMotionView, validationMetadataView, debugColorView};
+                                   long debugColorView, long receiverPositionMaterialView,
+                                   long receiverNormalRoughnessView,
+                                   long spatialDiagnosticCounterBuffer,
+                                   long spatialDiagnosticPairBuffer) {
+        long[] views = {receiverMotionView, validationMetadataView, debugColorView,
+                receiverPositionMaterialView, receiverNormalRoughnessView};
         VkDescriptorImageInfo.Buffer imageInfos = VkDescriptorImageInfo.calloc(IMAGE_COUNT, stack);
-        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(IMAGE_COUNT, stack);
+        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(RESOURCE_COUNT, stack);
         for (int binding = 0; binding < IMAGE_COUNT; binding++) {
             imageInfos.get(binding).imageView(views[binding])
                     .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             writes.get(binding).sType$Default().dstSet(set).dstBinding(binding)
                     .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .pImageInfo(VkDescriptorImageInfo.create(imageInfos.address(binding), 1));
+        }
+        long[] buffers = {spatialDiagnosticCounterBuffer, spatialDiagnosticPairBuffer};
+        VkDescriptorBufferInfo.Buffer bufferInfos =
+                VkDescriptorBufferInfo.calloc(BUFFER_COUNT, stack);
+        for (int buffer = 0; buffer < BUFFER_COUNT; buffer++) {
+            bufferInfos.get(buffer).buffer(buffers[buffer])
+                    .offset(0L).range(VK10.VK_WHOLE_SIZE);
+            int binding = IMAGE_COUNT + buffer;
+            writes.get(binding).sType$Default().dstSet(set).dstBinding(binding)
+                    .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+                    .pBufferInfo(VkDescriptorBufferInfo.create(bufferInfos.address(buffer), 1));
         }
         VK10.vkUpdateDescriptorSets(vk, writes, null);
     }

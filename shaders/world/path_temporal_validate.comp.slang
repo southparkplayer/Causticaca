@@ -10,8 +10,15 @@ import path_reservoir_common;
 [[vk::binding(0, 0)]] [format("rg16f")] RWTexture2D<float2> receiverMotion;
 [[vk::binding(1, 0)]] [format("r32ui")] RWTexture2D<uint> validationMetadata;
 [[vk::binding(2, 0)]] [format("rgba16f")] RWTexture2D<float4> debugColor;
+[[vk::binding(3, 0)]] [format("rgba32f")] RWTexture2D<float4> receiverPositionMaterial;
+[[vk::binding(4, 0)]] [format("rgba16f")] RWTexture2D<float4> receiverNormalRoughness;
+[[vk::binding(5, 0)]] RWStructuredBuffer<uint> spatialDiagnosticCounters;
+[[vk::binding(6, 0)]] RWStructuredBuffer<float2> spatialDiagnosticPairs;
 
 static const uint HISTORY_VALID = 1u << 7u;
+static const uint SPATIAL_DIAGNOSTIC_PAIR_CURSOR = 9u;
+static const uint SPATIAL_DIAGNOSTIC_PAIR_CAPACITY = 4096u;
+static const uint SPATIAL_DIAGNOSTIC_PAIR_MASK = 3u;
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
@@ -121,5 +128,125 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID) {
         else if (debugState == 11u) color = float3(1.00, 0.12, 0.55); // no canonical endpoint
         else color = float3(0.05, 0.95, 0.20);                       // strict compatibility accepted
         debugColor[pixel] = float4(color, 1.0);
+    }
+    if (pc.debugView == PATH_SPATIAL_DEBUG_VIEW) {
+        float4 receiverPosition = receiverPositionMaterial[pixel];
+        float4 receiverNormal = receiverNormalRoughness[pixel];
+        float receiverNormalLength = length(receiverNormal.xyz);
+        uint receiverMaterial = uint(max(receiverPosition.w, 0.0));
+        bool receiverPresent = receiverNormalLength >= 0.5
+                && receiverMaterial <= MATERIAL_PARTICLE
+                && current.weights.y > 0.0
+                && current.sampleRadianceTarget.w > 0.0;
+        uint compatibleCount = 0u;
+        uint validCount = 0u;
+        uint reconnectionCount = 0u;
+        bool depthRejected = false;
+        bool topologyRejected = false;
+        bool transportRejected = false;
+        bool footprintRejected = false;
+        bool diagnosticPairValid = false;
+        float2 diagnosticPair = float2(0.0);
+        if (receiverPresent) {
+            float3 receiverNormalUnit = receiverNormal.xyz / receiverNormalLength;
+            float receiverDistance = length(receiverPosition.xyz);
+            uint seed = pathHash(pixel.x * 2246822519u
+                    ^ pixel.y * 3266489917u ^ pc.frameIndex * 668265263u);
+            float rotation = float(seed) * (6.28318530718 / 4294967296.0);
+            for (uint sample = 0u; sample < PATH_SPATIAL_SAMPLE_COUNT; ++sample) {
+                float radiusFraction = sqrt((float(sample) + 0.5)
+                        / float(PATH_SPATIAL_SAMPLE_COUNT));
+                float angle = rotation + float(sample) * 2.39996322973;
+                float radius = 2.0 + radiusFraction * (PATH_SPATIAL_RADIUS - 2.0);
+                int2 offset = int2(round(float2(cos(angle), sin(angle)) * radius));
+                int2 neighborTexel = int2(pixel) + offset;
+                if (any(neighborTexel < int2(0, 0))
+                        || any(neighborTexel >= int2(width, height))) continue;
+                float4 neighborPosition = receiverPositionMaterial[neighborTexel];
+                float4 neighborNormal = receiverNormalRoughness[neighborTexel];
+                float neighborNormalLength = length(neighborNormal.xyz);
+                uint neighborMaterial = uint(max(neighborPosition.w, 0.0));
+                if (neighborNormalLength < 0.5 || neighborMaterial != receiverMaterial) continue;
+                float3 neighborNormalUnit = neighborNormal.xyz / neighborNormalLength;
+                float relativeDepth = abs(length(neighborPosition.xyz) - receiverDistance)
+                        / max(receiverDistance, 1.0);
+                if (dot(receiverNormalUnit, neighborNormalUnit) < PATH_SPATIAL_NORMAL_COS
+                        || relativeDepth > PATH_SPATIAL_RELATIVE_DEPTH) continue;
+                compatibleCount++;
+                uint neighborIndex = uint(neighborTexel.y) * width + uint(neighborTexel.x);
+                PathReservoir source =
+                        ConstPtr<PathReservoir>(pc.pathReservoirAddr)[neighborIndex];
+                if (source.weights.y <= 0.0 || source.sampleRadianceTarget.w <= 0.0) continue;
+                validCount++;
+                uint sourceMetadata = source.identity.w;
+                if (pathMetadataDepth(sourceMetadata)
+                        != pathMetadataDepth(current.identity.w)) {
+                    depthRejected = true;
+                    continue;
+                }
+                if (source.identity.z != current.identity.z) {
+                    topologyRejected = true;
+                    continue;
+                }
+                if (pathMetadataTransport(sourceMetadata)
+                        != pathMetadataTransport(current.identity.w)) {
+                    transportRejected = true;
+                    continue;
+                }
+                float sourceFootprint = max(source.proposalShift.z, 1.0e-5);
+                float receiverFootprint = max(current.proposalShift.z, 1.0e-5);
+                float footprintRatio = max(sourceFootprint, receiverFootprint)
+                        / min(sourceFootprint, receiverFootprint);
+                if (footprintRatio > PATH_MAX_FOOTPRINT_RATIO) {
+                    footprintRejected = true;
+                    continue;
+                }
+                uint reconnectionMetadata = asuint(source.reconnectionVertex.w);
+                bool reconnectionValid = (reconnectionMetadata & PATH_RECONNECTION_VALID) != 0u;
+                if (reconnectionValid && ((reconnectionMetadata >> 1u) & 0xFu) == 1u) {
+                    reconnectionCount++;
+                    if (!diagnosticPairValid
+                            && current.canonicalRadianceTarget.w > 0.0
+                            && source.canonicalRadianceTarget.w > 0.0) {
+                        diagnosticPair = float2(current.canonicalRadianceTarget.w,
+                                source.canonicalRadianceTarget.w);
+                        diagnosticPairValid = true;
+                    }
+                }
+            }
+        }
+        float3 spatialColor;
+        if (!receiverPresent) spatialColor = float3(0.0);
+        else if (reconnectionCount > 0u) spatialColor = float3(0.05, 0.95, 0.20);
+        else if (footprintRejected) spatialColor = float3(0.55, 0.10, 0.95);
+        else if (depthRejected) spatialColor = float3(0.85, 0.05, 0.80);
+        else if (topologyRejected) spatialColor = float3(0.15, 0.35, 0.95);
+        else if (transportRejected) spatialColor = float3(0.95, 0.72, 0.04);
+        else if (validCount > 0u) spatialColor = float3(0.10, 0.10, 0.10);
+        else if (compatibleCount > 0u) spatialColor = float3(0.95, 0.30, 0.04);
+        else spatialColor = float3(0.90, 0.06, 0.05);
+        uint category = !receiverPresent ? 0u
+                : reconnectionCount > 0u ? 1u
+                : footprintRejected ? 2u
+                : depthRejected ? 3u
+                : topologyRejected ? 4u
+                : transportRejected ? 5u
+                : validCount > 0u ? 6u
+                : compatibleCount > 0u ? 7u
+                : 8u;
+        InterlockedAdd(spatialDiagnosticCounters[category], 1u);
+        // Keep readback bounded: hash-subsample roughly one quarter of admitted pixels and retain
+        // raw canonical targets only. These are correlation diagnostics, not shifted GRIS targets.
+        uint pairHash = pathHash(pixelIndex ^ pc.frameIndex * 668265263u);
+        if (category == 1u && diagnosticPairValid
+                && (pairHash & SPATIAL_DIAGNOSTIC_PAIR_MASK) == 0u) {
+            uint pairIndex;
+            InterlockedAdd(spatialDiagnosticCounters[SPATIAL_DIAGNOSTIC_PAIR_CURSOR],
+                    1u, pairIndex);
+            if (pairIndex < SPATIAL_DIAGNOSTIC_PAIR_CAPACITY) {
+                spatialDiagnosticPairs[pairIndex] = diagnosticPair;
+            }
+        }
+        debugColor[pixel] = float4(spatialColor, 1.0);
     }
 }

@@ -865,7 +865,8 @@ public final class RtComposite {
                 String.format(Locale.ROOT, "%.2f", reservoirBytes / (1024.0 * 1024.0)));
         if (restirPt) {
             pathReservoirs.ensure(ctx, renderW, renderH,
-                    gMotion, temporalValidation.metadata(), output);
+                    gMotion, temporalValidation.metadata(), output,
+                    gRestirPositionMaterial, gRestirNormalRoughness);
             long pathReservoirBytes = pathReservoirs.allocatedBytes();
             CausticaMod.LOGGER.info(
                     "RT path reservoirs: render={}x{}, slots={}, stride={} B, bytes={}, gpuMiB={}",
@@ -933,6 +934,10 @@ public final class RtComposite {
                              RtDirectReservoirHistory.Frame reservoirFrame,
                              RtPathReservoirHistory.Frame pathReservoirFrame,
                              boolean restirPt) {
+        int debugView = debugView();
+        if (restirPt) {
+            pathReservoirs.pollSpatialDiagnosticCounters(ctx, frameCounter);
+        }
         long dstImage = vkImage(nativeColor);
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).caustica$getBackend();
         RtGpuExecutor gpuExecutor = ctx.gpuExecutor();
@@ -944,7 +949,6 @@ public final class RtComposite {
         RtGpuFrameStats.Slot gpuStats = null;
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "composite command buffer");
-        int debugView = debugView();
         RtTerrain terrain = RtTerrain.currentOrNull();
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope frameLabel = RtDebugLabels.scope(ctx, cmd, "composite frame")) {
             // RR drives the upscale: trace + jitter at render res, DLSS-RR denoises+upscales to display.
@@ -1116,7 +1120,8 @@ public final class RtComposite {
                             | (restirDirect ? 2 : 0)
                             | (restirPt ? 4 : 0)
                             | (restirPt && pathReservoirFrame.previousAvailable() ? 8 : 0)
-                            | (restirPt && debugView == 13 ? 16 : 0),
+                            | (restirPt && (debugView == 13 || debugView == 15 || debugView == 16
+                                    || debugView == 17) ? 16 : 0),
                     restirPt ? (int) pathReservoirFrame.generation() : 0).write(pushConstants);
             try (RtFrameStats.Scope ignoredTrace = RtFrameStats.FRAME.stage("frame.trace")) {
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world primary trace");
@@ -1144,7 +1149,8 @@ public final class RtComposite {
                              "path temporal admission");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage(
                              "frame.pathTemporalAdmission")) {
-                    pathReservoirs.recordTemporalAdmission(cmd, pushConstants);
+                    pathReservoirs.recordTemporalAdmission(
+                            cmd, pushConstants, debugView == 17);
                 }
                 VulkanCommandEncoder.memoryBarrier(cmd, stack);
             }
